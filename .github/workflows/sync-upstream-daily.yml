@@ -19,6 +19,7 @@ jobs:
 
       - name: Sync main with upstream
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -26,5 +27,9 @@ jobs:
           git fetch upstream main
           git fetch origin main
           git checkout -B main origin/main
-          git merge --ff-only upstream/main
+          if ! git merge --ff-only upstream/main; then
+            echo "Fast-forward sync failed because origin/main has diverged from upstream/main."
+            echo "Please resolve divergence manually."
+            exit 1
+          fi
           git push origin main
