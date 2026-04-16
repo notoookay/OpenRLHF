@@ -42,11 +42,13 @@ jobs:
           fi
 
           review_branch="upstream-sync-review"
-          git fetch origin "$review_branch:refs/remotes/origin/$review_branch" || true
+          if git ls-remote --exit-code --heads origin "$review_branch" >/dev/null 2>&1; then
+            git fetch origin "$review_branch:refs/remotes/origin/$review_branch"
+          fi
           git checkout -B "$review_branch" upstream/main
           if git show-ref --verify --quiet "refs/remotes/origin/$review_branch"; then
             remote_sha="$(git rev-parse refs/remotes/origin/$review_branch)"
-            git push --force-with-lease=refs/heads/$review_branch:$remote_sha origin "$review_branch"
+            git push --force-with-lease=$review_branch:$remote_sha origin "$review_branch"
           else
             git push --force-with-lease origin "$review_branch"
           fi
