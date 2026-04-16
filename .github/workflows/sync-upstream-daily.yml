@@ -44,9 +44,9 @@ jobs:
           git checkout -B "$review_branch" upstream/main
           if git show-ref --verify --quiet "refs/remotes/origin/$review_branch"; then
             remote_sha="$(git rev-parse refs/remotes/origin/$review_branch)"
-            git push --force-with-lease=refs/heads/$review_branch:$remote_sha origin "$review_branch"
+            git push --force-with-lease="refs/heads/${review_branch}:${remote_sha}" origin "$review_branch"
           else
-            git push --force-with-lease origin "$review_branch"
+            git push --force-with-lease="refs/heads/${review_branch}:" origin "$review_branch"
           fi
 
           echo "Fast-forward sync failed because origin/main has diverged from upstream/main."
