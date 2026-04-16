@@ -25,11 +25,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          if git remote get-url upstream >/dev/null 2>&1; then
-            git remote set-url upstream https://github.com/OpenRLHF/OpenRLHF.git
-          else
-            git remote add upstream https://github.com/OpenRLHF/OpenRLHF.git
-          fi
+          git remote add upstream https://github.com/OpenRLHF/OpenRLHF.git
           git fetch upstream main
           git fetch origin main
 
@@ -48,7 +44,7 @@ jobs:
           git checkout -B "$review_branch" upstream/main
           if git show-ref --verify --quiet "refs/remotes/origin/$review_branch"; then
             remote_sha="$(git rev-parse refs/remotes/origin/$review_branch)"
-            git push --force-with-lease=$review_branch:$remote_sha origin "$review_branch"
+            git push --force-with-lease=refs/heads/$review_branch:$remote_sha origin "$review_branch"
           else
             git push --force-with-lease origin "$review_branch"
           fi
