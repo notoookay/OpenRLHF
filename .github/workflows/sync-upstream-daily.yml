@@ -48,8 +48,11 @@ jobs:
           git checkout -B "$review_branch" upstream/main
           if git show-ref --verify --quiet "refs/remotes/origin/$review_branch"; then
             remote_sha="$(git rev-parse refs/remotes/origin/$review_branch)"
-            [ -n "$remote_sha" ]
-            lease_ref="refs/heads/upstream-sync-review:${remote_sha}"
+            if [ -z "$remote_sha" ]; then
+              echo "Failed to resolve remote SHA for $review_branch"
+              exit 1
+            fi
+            lease_ref="refs/heads/${review_branch}:${remote_sha}"
             git push --force-with-lease="$lease_ref" origin "$review_branch"
           else
             git push --force-with-lease="refs/heads/${review_branch}:" origin "$review_branch"
