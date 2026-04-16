@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   sync-upstream:
@@ -18,6 +19,7 @@ jobs:
           fetch-depth: 0
 
       - name: Sync main with upstream
+        id: sync
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -26,10 +28,57 @@ jobs:
           git remote add upstream https://github.com/OpenRLHF/OpenRLHF.git || true
           git fetch upstream main
           git fetch origin main
-          git checkout -B main origin/main
-          if ! git merge --ff-only upstream/main; then
-            echo "Fast-forward sync failed because origin/main has diverged from upstream/main."
-            echo "Please resolve divergence manually."
-            exit 1
+
+          if git merge-base --is-ancestor origin/main upstream/main; then
+            git checkout -B main origin/main
+            git merge --ff-only upstream/main
+            git push origin main
+            echo "needs_review=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          git push origin main
+
+          review_branch="upstream-sync-review"
+          git checkout -B "$review_branch" upstream/main
+          git push --force-with-lease origin "$review_branch"
+
+          echo "Fast-forward sync failed because origin/main has diverged from upstream/main."
+          echo "Created/updated branch '$review_branch' for manual review."
+          echo "needs_review=true" >> "$GITHUB_OUTPUT"
+          echo "review_branch=$review_branch" >> "$GITHUB_OUTPUT"
+
+      - name: Open manual review PR when branches diverge
+        if: steps.sync.outputs.needs_review == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = '${{ steps.sync.outputs.review_branch }}';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const { data: existing } = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'open',
+              head: `${owner}:${branch}`,
+              base: 'main',
+            });
+
+            if (existing.length > 0) {
+              core.info(`Manual review PR already exists: #${existing[0].number}`);
+              return;
+            }
+
+            const { data: created } = await github.rest.pulls.create({
+              owner,
+              repo,
+              title: 'Manual review required: upstream sync conflict',
+              head: branch,
+              base: 'main',
+              body: [
+                'Automatic fast-forward sync from `OpenRLHF/OpenRLHF` failed because `main` has diverged.',
+                '',
+                'Please review and merge this PR manually to resolve conflicts.',
+              ].join('\n'),
+            });
+
+            core.info(`Created manual review PR: #${created.number}`);
