@@ -53,6 +53,7 @@ OpenRLHF is **the first** high-performance, production-ready open-source RLHF fr
 <details>
 <summary>Show News</summary>
 
+- [2026/4] OpenRLHF 0.10 adds **VLM (Vision-Language Model) RLHF support** — train VLMs like Qwen3.5 with image inputs end-to-end. Training script: [train_vlm_math_hybrid_engine.sh](./examples/scripts/train_vlm_math_hybrid_engine.sh)
 - [2026/2] [ProRL V2](https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/) uses REINFORCE++-baseline to train a state-of-the-art 1.5B reasoning model with prolonged RL training. Training script: [train_prorlv2_math_hybrid_engine.sh](./examples/scripts/train_prorlv2_math_hybrid_engine.sh)
 - [2025/10] [ScaleRL](https://arxiv.org/abs/2510.13786) validates the effectiveness of REINFORCE++-baseline in large-scale training scenarios. Releases [REINFORCE++ slides](https://docs.google.com/presentation/d/1stieP_3PM1z4Hq1YWR3GywFkxcHEAlstXMaS23KlGN4)
 - [2025/6] [Magistral](https://mistral.ai/static/research/magistral.pdf) uses the method quite similar to REINFORCE++-baseline to train the reasoning models.
@@ -252,6 +253,7 @@ OpenRLHF provides a complete RLHF pipeline with agent-based flexibility:
 - Multi-node training with [SLURM](./examples/scripts/train_ppo_ray_slurm.sh)
 
 **Model Support**
+- [VLM (Vision-Language Models)](./examples/scripts/train_vlm_math_hybrid_engine.sh) — tested with Qwen3.5 (`--image_key`, `--max_images_per_prompt`)
 - [LoRA/QLoRA](./examples/scripts/train_sft_mixtral_lora.sh) (`--lora_rank`, `--load_in_4bit`)
 - [Mixture of Experts (MoE)](./examples/test_scripts/train_sft_moe.sh) (`--aux_loss_coef`)
 - FlashAttention (`--attn_implementation`)
@@ -283,7 +285,7 @@ sudo pip uninstall xgboost transformer_engine flash_attn pynvml -y
 
 # 3. Install OpenRLHF (choose one)
 pip install openrlhf                    # Basic
-pip install openrlhf[vllm]              # + vLLM 0.18.0 (recommended)
+pip install openrlhf[vllm]              # + vLLM 0.19.0 (recommended)
 pip install openrlhf[vllm_latest]       # + Latest vLLM
 pip install openrlhf[vllm,ring,liger]   # + All optimizations
 ```
@@ -297,7 +299,7 @@ pip install -e .
 ```
 
 > [!TIP]
-> We recommend **vLLM 0.18.0+** for best performance. See [Dockerfiles](./dockerfile/) and [Nvidia-Docker Install Script](./examples/scripts/nvidia_docker_install.sh).
+> We recommend **vLLM 0.19.0+** for best performance. See [Dockerfiles](./dockerfile/) and [Nvidia-Docker Install Script](./examples/scripts/nvidia_docker_install.sh).
 
 ### Prepare Datasets
 

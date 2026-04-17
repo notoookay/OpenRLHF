@@ -20,20 +20,21 @@ def _collect_prompt_batch(dataloader_iter, num_prompts: int):
     collecting the returned prompts. Callers should still process any partial
     batch that was collected before exhaustion.
     """
-    prompts, labels = [], []
+    prompts, labels, images = [], [], []
     exhausted = False
 
     while len(prompts) < num_prompts:
         try:
-            _, batch_prompts, batch_labels = next(dataloader_iter)
+            _, batch_prompts, batch_labels, batch_images = next(dataloader_iter)
             remaining = num_prompts - len(prompts)
             prompts.extend(batch_prompts[:remaining])
             labels.extend(batch_labels[:remaining])
+            images.extend(batch_images[:remaining])
         except StopIteration:
             exhausted = True
             break
 
-    return prompts, labels, exhausted
+    return prompts, labels, images, exhausted
 
 
 class SamplesGenerator:
@@ -86,34 +87,53 @@ class SamplesGenerator:
 
     @torch.no_grad()
     def generate_samples(self, **generate_kwargs) -> Tuple[List[Experience], Optional[float], int, bool]:
-        """Produce one batch and indicate if the dataloader is exhausted."""
+        """Produce one training-sized batch and indicate if the dataloader is exhausted.
+
+        When vllm_generate_batch_size > rollout_batch_size, a single vLLM call
+        may produce more samples than one training step needs.  Extras are kept
+        in ``_sample_buffer`` and served in subsequent calls without hitting vLLM.
+        """
         if getattr(self, "_dataloader_iter", None) is None:
             self._dataloader_iter = iter(self.prompts_dataloader)
+            self._sample_buffer: List[Experience] = []
 
-        # Wake sleeping vLLM engines before dispatching.
-        if self.args.vllm_enable_sleep:
-            batch_vllm_engine_call(self.vllm_engines, "wake_up")
-
-        experiences, prompts_consumed, exhausted = self._generate_vllm(
-            dataloader_iter=self._dataloader_iter,
-            num_prompts=self.args.rollout_batch_size,
-            dynamic_filtering=self.args.dynamic_filtering,
-            **generate_kwargs,
-        )
-
-        # Put engines back to sleep when enabled.
-        if self.args.vllm_enable_sleep:
-            batch_vllm_engine_call(self.vllm_engines, "sleep")
-
+        chunk_size = self.args.rollout_batch_size * self.args.n_samples_per_prompt
+        prompts_consumed = 0
         filter_pass_rate = None
-        if self.args.dynamic_filtering and prompts_consumed:
-            filter_pass_rate = len(experiences) / prompts_consumed * 100
 
-        if exhausted:
-            self._dataloader_iter = None
-            logger.info("Prompt dataloader is exhausted.")
+        # Fill buffer if it doesn't have enough for one training chunk.
+        if len(self._sample_buffer) < chunk_size and self._dataloader_iter is not None:
+            if self.args.vllm_enable_sleep:
+                batch_vllm_engine_call(self.vllm_engines, "wake_up")
 
-        return experiences, filter_pass_rate, prompts_consumed, exhausted
+            gen_batch_size = getattr(self.args, "vllm_generate_batch_size", None) or self.args.rollout_batch_size
+            experiences, prompts_consumed, dl_exhausted = self._generate_vllm(
+                dataloader_iter=self._dataloader_iter,
+                num_prompts=gen_batch_size,
+                dynamic_filtering=self.args.dynamic_filtering,
+                **generate_kwargs,
+            )
+
+            if self.args.vllm_enable_sleep:
+                batch_vllm_engine_call(self.vllm_engines, "sleep")
+
+            if self.args.dynamic_filtering and prompts_consumed:
+                filter_pass_rate = len(experiences) / prompts_consumed * 100
+
+            self._sample_buffer.extend(experiences)
+
+            if dl_exhausted:
+                self._dataloader_iter = None
+                logger.info("Prompt dataloader is exhausted.")
+
+        # Take up to one training chunk from the buffer.
+        rollout_samples = self._sample_buffer[:chunk_size]
+        self._sample_buffer = self._sample_buffer[chunk_size:]
+
+        # Exhausted only when dataloader is done AND buffer is fully drained.
+        exhausted = self._dataloader_iter is None and len(self._sample_buffer) == 0
+
+        return rollout_samples, filter_pass_rate, prompts_consumed, exhausted
 
     def _generate_vllm(
         self, dataloader_iter, num_prompts: int, dynamic_filtering, **generate_kwargs
@@ -126,12 +146,12 @@ class SamplesGenerator:
         prompts_consumed = 0
         accepted_experiences: List[Experience] = []
 
-        prompts, labels, exhausted = _collect_prompt_batch(dataloader_iter, num_prompts)
+        prompts, labels, images, exhausted = _collect_prompt_batch(dataloader_iter, num_prompts)
         if not prompts:
             return [], prompts_consumed, True
 
         target_num_prompts = len(prompts)
-        pending_refs = self._dispatch_prompts_to_vllm(prompts, labels, **generate_kwargs)
+        pending_refs = self._dispatch_prompts_to_vllm(prompts, labels, images=images, **generate_kwargs)
         prompts_consumed += target_num_prompts
 
         pbar = tqdm(range(target_num_prompts), desc="Generate samples")
@@ -160,19 +180,23 @@ class SamplesGenerator:
                     pbar.update()
                 elif dynamic_filtering:
                     # Dispatch replacement for filtered prompt.
-                    new_prompts, new_labels, exhausted = _collect_prompt_batch(dataloader_iter, 1)
+                    new_prompts, new_labels, new_images, exhausted = _collect_prompt_batch(dataloader_iter, 1)
                     prompts_consumed += len(new_prompts)
                     if exhausted and not new_prompts:
                         for remaining_ref in pending_refs:
                             ray.cancel(remaining_ref)
                         return [], prompts_consumed, True
                     if new_prompts:
-                        new_refs = self._dispatch_prompts_to_vllm(new_prompts, new_labels, **generate_kwargs)
+                        new_refs = self._dispatch_prompts_to_vllm(
+                            new_prompts, new_labels, images=new_images, **generate_kwargs
+                        )
                         pending_refs.extend(new_refs)
 
         return accepted_experiences, prompts_consumed, exhausted
 
-    def _dispatch_prompts_to_vllm(self, prompts: List[str], labels: List[str], **generate_kwargs) -> List:
+    def _dispatch_prompts_to_vllm(
+        self, prompts: List[str], labels: List[str], *, images: List = None, **generate_kwargs
+    ) -> List:
         """Send prompts to rollout executors and return Ray object refs."""
         sampling_params = SamplingParams(
             temperature=generate_kwargs.get("temperature", 1.0),
@@ -198,8 +222,11 @@ class SamplesGenerator:
             engine_indices.append(engine_idx)
             heapq.heappush(engine_heap, (current_load + n_samples, engine_idx))
 
+        if images is None:
+            images = [None] * len(prompts)
+
         refs = []
-        for idx, (prompt, label) in enumerate(zip(prompts, labels)):
+        for idx, (prompt, label, img) in enumerate(zip(prompts, labels, images)):
             # Spread work across engines/workers in load-aware order.
             llm_engine = self.vllm_engines[engine_indices[idx]]
             ref = llm_engine.generate_responses.remote(
@@ -209,6 +236,7 @@ class SamplesGenerator:
                 max_length=truncate_length,
                 hf_tokenizer=self.tokenizer,
                 num_samples=n_samples,
+                images=img,
             )
             refs.append(ref)
 
@@ -273,6 +301,8 @@ class SamplesGenerator:
             rollout_log_probs=rollout_log_probs.unsqueeze(0) if rollout_log_probs is not None else None,
             prompts=[response["prompt"]],
             labels=[response["label"]],
+            images=[response.get("images")],
+            mm_train_inputs=[response.get("mm_train_inputs")],
             rewards=torch.tensor([reward_val]) if reward_val is not None else None,
             scores=torch.tensor([score_val]) if score_val is not None else None,
             response_length=torch.tensor([response_length]),

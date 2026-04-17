@@ -69,6 +69,7 @@ def train(args):
         True,
         True,
         train_dataset.collate_fn,
+        num_workers=args.dataloader_num_workers,
     )
 
     if getattr(args, "eval_dataset", None):
@@ -95,6 +96,7 @@ def train(args):
         True,
         False,
         eval_dataset.collate_fn,
+        num_workers=args.dataloader_num_workers,
     )
 
     # scheduler
@@ -116,14 +118,15 @@ def train(args):
         )
 
     # strategy prepare
-    (model, optim, scheduler) = strategy.prepare((model, optim, scheduler))
+    model, optim, scheduler = strategy.prepare((model, optim, scheduler))
 
     # load checkpoint
     consumed_samples = 0
     if args.load_checkpoint and os.path.exists(args.ckpt_path):
-        _, states = strategy.load_ckpt(model, args.ckpt_path)
-        consumed_samples = states["consumed_samples"]
-        strategy.print(f"Loaded the checkpoint: {args.ckpt_path}, consumed_samples: {consumed_samples}")
+        load_path, states = strategy.load_ckpt(model, args.ckpt_path)
+        if load_path is not None:
+            consumed_samples = states["consumed_samples"]
+            strategy.print(f"Loaded the checkpoint: {args.ckpt_path}, consumed_samples: {consumed_samples}")
 
     os.makedirs(args.save_path, exist_ok=True)
 
@@ -167,7 +170,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_steps", type=int, default=-1)
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_rm")
     parser.add_argument("--max_ckpt_num", type=int, default=3)
-    parser.add_argument("--max_ckpt_mem", type=int, default=1e8)
+    parser.add_argument("--max_ckpt_mem", type=int, default=int(1e8))
     parser.add_argument("--load_checkpoint", action="store_true", default=False)
     parser.add_argument("--use_ds_universal_ckpt", action="store_true", default=False)
 
@@ -203,6 +206,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_comm", action="store_true", default=False)
     parser.add_argument("--gradient_checkpointing_use_reentrant", action="store_true", default=False)
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
+    parser.add_argument("--dataloader_num_workers", type=int, default=0, help="Number of dataloader workers for IO")
     parser.add_argument("--ds_tensor_parallel_size", type=int, default=1, help="DeepSpeed Tensor parallel size")
 
     # Models
@@ -281,7 +285,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.input_template and "{}" not in args.input_template:
-        print("[Warning] {} not in args.input_template, set to None")
+        print("[Warning] '{}' not in args.input_template, set to None")
         args.input_template = None
 
     if args.input_template and "\\n" in args.input_template:

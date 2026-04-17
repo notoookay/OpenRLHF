@@ -1,4 +1,5 @@
 import argparse
+import os
 from datetime import datetime
 
 import ray
@@ -18,12 +19,14 @@ from openrlhf.utils import get_strategy
 def train(args):
     # initialize ray if not initialized
     if not ray.is_initialized():
+        # Use os.environ.get() to respect user-set values (e.g. NCCL_DEBUG=INFO via
+        # ray job submit --runtime-env-json), falling back to sensible defaults.
         ray.init(
             runtime_env={
                 "env_vars": {
-                    "TOKENIZERS_PARALLELISM": "true",
-                    "NCCL_DEBUG": "WARN",
-                    "RAY_ENABLE_ZERO_COPY_TORCH_TENSORS": "1",
+                    "TOKENIZERS_PARALLELISM": os.environ.get("TOKENIZERS_PARALLELISM", "true"),
+                    "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "WARN"),
+                    "RAY_ENABLE_ZERO_COPY_TORCH_TENSORS": os.environ.get("RAY_ENABLE_ZERO_COPY_TORCH_TENSORS", "1"),
                 }
             }
         )
@@ -75,6 +78,7 @@ def train(args):
             "processed_logprobs" if args.enable_vllm_is_correction else None,
             agent_func_path=args.agent_func_path,
             remote_rm_url=args.remote_rm_url,
+            max_images_per_prompt=getattr(args, "max_images_per_prompt", 0),
         )
 
     actor_model = RayActorGroup(
@@ -175,7 +179,7 @@ def train(args):
     if critic_model is not None and args.critic_pretrain:
         # critic scheduler initialization depends on max_step, so we have to init critic after actor
         # TODO: use first reward model as critic model
-        refs.extend(critic_model.async_init_model_from_pretrained(strategy, args.critic_pretrain, max_steps))
+        refs = critic_model.async_init_model_from_pretrained(strategy, args.critic_pretrain, max_steps)
         ray.get(refs)
 
     # train actor and critic model
@@ -327,6 +331,12 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_checkpointing_use_reentrant", action="store_true", default=False)
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
     parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=0,
+        help="Number of dataloader workers for IO (for Ray training, ensure sufficient CPU resources per actor)",
+    )
+    parser.add_argument(
         "--deepspeed_enable_sleep",
         action="store_true",
         default=False,
@@ -356,7 +366,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vllm_generate_batch_size", type=int, default=None, help="Batch size for vLLM generating samples"
     )
-    parser.add_argument("--micro_rollout_batch_size", type=int, default=8)
+    parser.add_argument("--micro_rollout_batch_size", type=int, default=1)
     parser.add_argument("--max_epochs", type=int, default=1)
     parser.add_argument("--max_len", type=int, default=2048, help="Max total sequence length (prompt + response)")
     parser.add_argument(
@@ -365,7 +375,7 @@ if __name__ == "__main__":
         default=None,
         help="Max tokens to generate per sample. If None, dynamically computed as max_len - prompt_len per sample.",
     )
-    parser.add_argument("--max_samples", type=int, default=1e8, help="Max number of samples")
+    parser.add_argument("--max_samples", type=int, default=int(1e8), help="Max number of samples")
     parser.add_argument("--max_norm", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--l2", type=float, default=0.0, help="weight decay loss")
     parser.add_argument("--ptx_coef", type=float, default=0.05, help="PPO-ptx loss coef")
@@ -375,7 +385,7 @@ if __name__ == "__main__":
     parser.add_argument("--value_clip", type=float, default=0.5, help="PPO value clip range")
     parser.add_argument("--lambd", type=float, default=1, help="PPO GAE lambd")
     parser.add_argument("--gamma", type=float, default=1, help="PPO GAE gamma")
-    parser.add_argument("--micro_train_batch_size", type=int, default=4, help="batch size per GPU")
+    parser.add_argument("--micro_train_batch_size", type=int, default=1, help="batch size per GPU")
     parser.add_argument("--train_batch_size", type=int, default=128, help="Global training batch size")
     parser.add_argument("--normalize_reward", action="store_true", default=False, help="Enable Reward Normalization")
     parser.add_argument("--top_p", type=float, default=1.0)
@@ -506,6 +516,18 @@ if __name__ == "__main__":
         "--dynamic_filtering_reward_range", nargs=2, default=(0, 1), type=float, help="Dynamic filtering rewards range"
     )
 
+    # VLM (Vision-Language Model) parameters
+    parser.add_argument("--image_key", type=str, default="images", help="Dataset key for image paths/URLs")
+    parser.add_argument(
+        "--max_images_per_prompt", type=int, default=0, help="Max images per prompt for vLLM (0 = text-only)"
+    )
+    parser.add_argument(
+        "--freeze_visual_encoder",
+        action="store_true",
+        default=False,
+        help="Freeze vision encoder weights (only train language model). Reduces memory and weight sync overhead.",
+    )
+
     # TensorBoard parameters
     parser.add_argument("--use_tensorboard", type=str, default=None, help="TensorBoard logging path")
 
@@ -535,11 +557,23 @@ if __name__ == "__main__":
     if args.advantage_estimator in ["rloo", "reinforce_baseline", "group_norm"]:
         assert args.n_samples_per_prompt > 1, f"{args.advantage_estimator} requires n_samples_per_prompt > 1"
 
+    # VLM constraints: critic and packing_samples are not supported
+    if args.max_images_per_prompt > 0:
+        assert args.critic_pretrain is None, (
+            "VLM training does not support critic model. "
+            "Use --advantage_estimator other than 'gae' (e.g., reinforce_baseline, rloo, group_norm)."
+        )
+        assert not args.packing_samples, (
+            "VLM training does not support --packing_samples. "
+            "Packing collapses the batch dimension, breaking alignment between image tokens and pixel_values. "
+            "VLM models also require model-computed position_ids (e.g., M-RoPE) which is incompatible with packing."
+        )
+
     if args.remote_rm_url:
         args.remote_rm_url = args.remote_rm_url.split(",")
 
     if args.input_template and "{}" not in args.input_template:
-        print("[Warning] {} not in args.input_template, set to None")
+        print("[Warning] '{}' not in args.input_template, set to None")
         args.input_template = None
 
     if args.input_template and "\\n" in args.input_template:
@@ -595,6 +629,12 @@ if __name__ == "__main__":
     # Set vLLM generate_batch_size to rollout_batch_size if not specified
     if not args.vllm_generate_batch_size:
         args.vllm_generate_batch_size = args.rollout_batch_size
+
+    if args.vllm_generate_batch_size > args.rollout_batch_size:
+        assert args.async_train, (
+            "--vllm_generate_batch_size > --rollout_batch_size requires --async_train "
+            "(over-sampling needs async queue to buffer extra batches)."
+        )
 
     if args.dynamic_filtering:
         assert (
