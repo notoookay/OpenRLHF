@@ -8,6 +8,28 @@ import torch.nn.functional as F
 from .utils import masked_mean
 
 
+def aggregate_loss(
+    loss: torch.Tensor,
+    loss_mask: torch.Tensor,
+    token_level_loss: bool = True,
+    dp_size: int = 1,
+    batch_num_tokens: Optional[float] = None,
+    global_batch_size: Optional[float] = None,
+) -> torch.Tensor:
+    """Aggregate token losses using verl-compatible normalization."""
+    if token_level_loss:
+        if batch_num_tokens is None:
+            return masked_mean(loss, loss_mask, dim=None)
+        return (loss * loss_mask).sum() / batch_num_tokens * dp_size
+
+    token_counts = loss_mask.sum(dim=-1)
+    seq_loss = (loss * loss_mask).sum(dim=-1) / (token_counts + 1e-8)
+    seq_mask = (token_counts > 0).float()
+    if global_batch_size is None:
+        return masked_mean(seq_loss, seq_mask, dim=None)
+    return (seq_loss * seq_mask).sum() / global_batch_size * dp_size
+
+
 class GPTLMLoss(nn.Module):
     """
     GPT Language Model Loss
@@ -62,11 +84,21 @@ class SFTLoss(nn.Module):
         super().__init__()
         self.token_level_loss = token_level_loss
 
-    def forward(self, per_token_logps: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
-        loss = (
-            masked_mean(-per_token_logps, loss_mask, dim=None)
-            if self.token_level_loss
-            else masked_mean(-per_token_logps, loss_mask, dim=-1).mean()
+    def forward(
+        self,
+        per_token_logps: torch.Tensor,
+        loss_mask: torch.Tensor,
+        dp_size: int = 1,
+        batch_num_tokens: Optional[float] = None,
+        global_batch_size: Optional[float] = None,
+    ) -> torch.Tensor:
+        loss = aggregate_loss(
+            -per_token_logps,
+            loss_mask,
+            token_level_loss=self.token_level_loss,
+            dp_size=dp_size,
+            batch_num_tokens=batch_num_tokens,
+            global_batch_size=global_batch_size,
         )
 
         return loss
@@ -118,17 +150,22 @@ class PolicyLoss(nn.Module):
         advantages: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
         rollout_log_probs: Optional[torch.Tensor] = None,
+        dp_size: int = 1,
+        batch_num_tokens: Optional[float] = None,
+        global_batch_size: Optional[float] = None,
     ) -> torch.Tensor:
+        raw_policy_log_ratio = log_probs - old_log_probs
         if self.policy_loss_type == "ppo":
-            log_ratio = log_probs - old_log_probs
-            ratio = log_ratio.exp()
+            policy_log_ratio = raw_policy_log_ratio.clamp(min=-20.0, max=20.0)
+            ratio = policy_log_ratio.exp()
         elif self.policy_loss_type == "gspo":
             # GSPO: https://arxiv.org/pdf/2507.18071
             if self.enable_vllm_is_correction:
                 log_ratio = log_probs - rollout_log_probs
             else:
-                log_ratio = log_probs - old_log_probs
-            ratio = (log_ratio * action_mask).sum(dim=-1) / action_mask.sum(dim=-1)
+                log_ratio = raw_policy_log_ratio
+            policy_log_ratio = raw_policy_log_ratio.clamp(min=-20.0, max=20.0)
+            ratio = (log_ratio * action_mask).sum(dim=-1) / action_mask.sum(dim=-1).clamp(min=1)
             ratio = ratio.exp().unsqueeze(-1) * action_mask
         else:
             raise ValueError(f"Invalid policy loss type: {self.policy_loss_type}")
@@ -151,34 +188,37 @@ class PolicyLoss(nn.Module):
         vllm_kl = None
         if self.enable_vllm_is_correction and self.policy_loss_type == "ppo":
             low_threshold, high_threshold = self.vllm_is_truncated_threshold
-            log_ratio = old_log_probs - rollout_log_probs
+            rollout_log_ratio = old_log_probs - rollout_log_probs
             if self.vllm_is_correction_type == "icepop":
                 # ICEPOP: token-level filtering (set coefficients outside the interval to 0)
-                vllm_is = torch.exp(log_ratio).detach()
+                vllm_is = torch.exp(rollout_log_ratio).detach()
                 mask = (vllm_is >= low_threshold) & (vllm_is <= high_threshold)
                 vllm_is = vllm_is * mask
                 loss = vllm_is * loss
             elif self.vllm_is_correction_type == "seq-mask-tis":
                 # seq-mask-tis: use sequence-level geometric mean only for filtering,
                 # correction coefficients still use TIS (token-level clamp)
-                seq_log_ratio = masked_mean(log_ratio, action_mask, dim=-1)
+                seq_log_ratio = masked_mean(rollout_log_ratio, action_mask, dim=-1)
                 seq_is = torch.exp(seq_log_ratio)
                 seq_mask = (seq_is >= low_threshold) & (seq_is <= high_threshold)
-                vllm_is = torch.exp(log_ratio).detach()
+                vllm_is = torch.exp(rollout_log_ratio).detach()
                 loss = seq_mask.unsqueeze(-1) * vllm_is * loss
             else:
                 # TIS: token-level clamp with low and high thresholds
-                vllm_is = torch.exp(log_ratio).clamp(min=low_threshold, max=high_threshold).detach()
+                vllm_is = torch.exp(rollout_log_ratio).clamp(min=low_threshold, max=high_threshold).detach()
                 loss = vllm_is * loss
             vllm_kl = masked_mean(rollout_log_probs - old_log_probs, action_mask, dim=None)
 
-        loss = (
-            masked_mean(loss, action_mask, dim=None)
-            if self.token_level_loss
-            else masked_mean(loss, action_mask, dim=-1).mean()
+        loss = aggregate_loss(
+            loss,
+            action_mask,
+            token_level_loss=self.token_level_loss,
+            dp_size=dp_size,
+            batch_num_tokens=batch_num_tokens,
+            global_batch_size=global_batch_size,
         )
         clip_ratio = masked_mean(torch.lt(surr2, surr1).float(), action_mask, dim=None)
-        ppo_kl = masked_mean(-log_ratio.detach(), action_mask, dim=None)
+        ppo_kl = masked_mean(-raw_policy_log_ratio.detach(), action_mask, dim=None)
         return loss, clip_ratio, ppo_kl, vllm_kl
 
 
@@ -198,6 +238,9 @@ class ValueLoss(nn.Module):
         old_values: torch.Tensor,
         returns: torch.Tensor,
         action_mask: Optional[torch.Tensor] = None,
+        dp_size: int = 1,
+        batch_num_tokens: Optional[float] = None,
+        global_batch_size: Optional[float] = None,
     ) -> torch.Tensor:
         if self.clip_eps is not None:
             values_clipped = old_values + (values - old_values).clamp(-self.clip_eps, self.clip_eps)
@@ -207,10 +250,13 @@ class ValueLoss(nn.Module):
         else:
             loss = (values - returns) ** 2
 
-        loss = (
-            masked_mean(loss, action_mask, dim=None)
-            if self.token_level_loss
-            else masked_mean(loss, action_mask, dim=-1).mean()
+        loss = aggregate_loss(
+            loss,
+            action_mask,
+            token_level_loss=self.token_level_loss,
+            dp_size=dp_size,
+            batch_num_tokens=batch_num_tokens,
+            global_batch_size=global_batch_size,
         )
         return 0.5 * loss
 

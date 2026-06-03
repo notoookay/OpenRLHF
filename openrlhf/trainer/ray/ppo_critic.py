@@ -17,6 +17,7 @@ from openrlhf.utils.deepspeed.deepspeed_utils import (
     offload_deepspeed_states,
     reload_deepspeed_states,
 )
+from openrlhf.utils.loss_utils import get_loss_batch_info
 
 from ..ppo_utils import NaiveReplayBuffer
 from .launcher import BaseModelActor
@@ -117,6 +118,13 @@ class CriticPPOTrainer(ABC):
         action_mask = experience.action_mask
         packed_seq_lens = None
         attention_mask = experience.attention_mask
+        loss_batch_info = get_loss_batch_info(
+            self.strategy,
+            action_mask,
+            replay_buffer=self.replay_buffer,
+            step=step,
+            dynamic_batch=self.args.train.dynamic_batch_enable,
+        )
 
         # critic loss
         values, output = self.critic(
@@ -135,15 +143,17 @@ class CriticPPOTrainer(ABC):
             old_values,
             returns,
             action_mask=experience.action_mask,
+            **loss_batch_info,
         )
         # mixtral
         if self.aux_loss:
             aux_loss = output.aux_loss
         else:
             aux_loss = 0
-        loss = critic_loss + aux_loss * self.args.actor.aux_loss_coef
+        aux_loss = aux_loss * self.args.actor.aux_loss_coef
         if self.args.train.dynamic_batch_enable:
-            loss = loss * self.replay_buffer.dynamic_loss_scale[step]
+            aux_loss = aux_loss * self.replay_buffer.dynamic_sample_loss_scale[step]
+        loss = critic_loss + aux_loss
 
         self.strategy.backward(loss, self.critic, self.critic_optim)
         if self.args.train.dynamic_batch_enable:

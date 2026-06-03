@@ -41,7 +41,9 @@ class NaiveReplayBuffer(ABC):
         self.items: List[Experience] = []
         self.dynamic_batch = dynamic_batch
         self.dynamic_indices: List[List[int]] = []
-        self.dynamic_loss_scale: List[float] = []
+        self.dynamic_sample_loss_scale: List[float] = []
+        self.dynamic_batch_num_tokens: List[float] = []
+        self.dynamic_global_batch_size: List[float] = []
         self.dynamic_optimizer_step: List[int] = []
 
     @torch.no_grad()
@@ -90,8 +92,8 @@ class NaiveReplayBuffer(ABC):
         args = strategy.args
         sample_lengths = [sample.total_length.item() for sample in self.items]
 
-        world_size = dist.get_world_size()
-        dp_size = world_size // args.ds.ring_attn_size // args.ds.tensor_parallel_size
+        dp_group = strategy.ds_device_mesh["dp"].get_group()
+        dp_size = dist.get_world_size(group=dp_group)
         local_train_batch_size = args.train.batch_size // dp_size
         # Expected num_steps assumes a full buffer, but async + partial_rollout
         # can deliver a short buffer at episode boundaries — clamp to avoid
@@ -99,6 +101,17 @@ class NaiveReplayBuffer(ABC):
         # karmarkar_karp with num_mbs=0).
         expected_num_steps = args.rollout.batch_size * args.rollout.n_samples_per_prompt // args.train.batch_size
         num_steps = min(expected_num_steps, len(sample_lengths) // local_train_batch_size)
+        num_steps = torch.tensor(num_steps, dtype=torch.int, device=torch.cuda.current_device())
+        dist.all_reduce(num_steps, op=dist.ReduceOp.MIN, group=dp_group)
+        num_steps = num_steps.item()
+        if num_steps == 0:
+            self.dynamic_indices = []
+            self.sample_batch_size = 1
+            self.dynamic_sample_loss_scale = []
+            self.dynamic_batch_num_tokens = []
+            self.dynamic_global_batch_size = []
+            self.dynamic_optimizer_step = []
+            return
 
         # split by train_batch_size, sync num_microbatches across dp
         num_microbatches = []
@@ -133,13 +146,32 @@ class NaiveReplayBuffer(ABC):
         self.sample_batch_size = 1
 
         # adjust optimizer step and loss scale
-        loss_scales = []
+        sample_loss_scales = []
+        batch_num_tokens = []
+        global_batch_sizes = []
         optimizer_steps = []
         for partitions in data_partitions:
             sample_num = sum(len(partition) for partition in partitions)
-            loss_scale = [len(partition) / sample_num for partition in partitions]
+            valid_sample_num = sum(
+                int(self.items[idx].action_mask.sum().item() > 0) for partition in partitions for idx in partition
+            )
+            global_valid_sample_num = torch.tensor(
+                valid_sample_num, dtype=torch.float, device=torch.cuda.current_device()
+            )
+            dist.all_reduce(global_valid_sample_num, op=dist.ReduceOp.SUM, group=dp_group)
+            global_num_tokens = torch.tensor(
+                sum(int(self.items[idx].action_mask.sum().item()) for partition in partitions for idx in partition),
+                dtype=torch.float,
+                device=torch.cuda.current_device(),
+            )
+            dist.all_reduce(global_num_tokens, op=dist.ReduceOp.SUM, group=dp_group)
+            sample_loss_scale = [len(partition) / sample_num for partition in partitions]
             optimizer_step = [0] * (len(partitions) - 1) + [1]
-            loss_scales.extend(loss_scale)
+            sample_loss_scales.extend(sample_loss_scale)
+            batch_num_tokens.extend([global_num_tokens.item()] * len(partitions))
+            global_batch_sizes.extend([global_valid_sample_num.item()] * len(partitions))
             optimizer_steps.extend(optimizer_step)
-        self.dynamic_loss_scale = loss_scales
+        self.dynamic_sample_loss_scale = sample_loss_scales
+        self.dynamic_batch_num_tokens = batch_num_tokens
+        self.dynamic_global_batch_size = global_batch_sizes
         self.dynamic_optimizer_step = optimizer_steps

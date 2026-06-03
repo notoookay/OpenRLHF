@@ -12,6 +12,45 @@ from .ring_attn_utils import gather_and_pad_tensor, unpad_and_slice_tensor
 from .utils import compute_entropy, log_probs_from_logits, set_z3_leaf_modules
 
 
+# Fix https://github.com/OpenRLHF/OpenRLHF/issues/1232
+def _patch_zero3_weight_mapping():
+    try:
+        import transformers.integrations.deepspeed as hf_deepspeed
+        from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+    except (ImportError, AttributeError):
+        return
+
+    original_fn = getattr(hf_deepspeed, "_apply_weight_conversions_to_state_dict", None)
+    if original_fn is None or getattr(original_fn, "_openrlhf_patched", False):
+        return
+
+    def patched_fn(model, state_dict, weight_mapping):
+        model_state_dict = model.state_dict()
+        renamings = [entry for entry in weight_mapping if isinstance(entry, WeightRenaming)]
+        converters = [entry for entry in weight_mapping if isinstance(entry, WeightConverter)]
+        prefix = model.base_model_prefix
+
+        metadata = getattr(state_dict, "_metadata", None)
+        exact_matches = {}
+        mapped_state_dict = state_dict.copy()
+        if metadata is not None:
+            mapped_state_dict._metadata = metadata
+
+        for key in list(state_dict.keys()):
+            renamed_key, _ = rename_source_key(key, renamings, converters, prefix, model_state_dict)
+            if renamed_key not in model_state_dict and key in model_state_dict:
+                exact_matches[key] = mapped_state_dict.pop(key)
+
+        converted_state_dict = original_fn(model, mapped_state_dict, weight_mapping)
+        converted_state_dict.update(exact_matches)
+        if metadata is not None:
+            converted_state_dict._metadata = metadata
+        return converted_state_dict
+
+    patched_fn._openrlhf_patched = True
+    hf_deepspeed._apply_weight_conversions_to_state_dict = patched_fn
+
+
 class Actor(nn.Module):
     """
     Base class for Actor models in reinforcement learning.
@@ -63,6 +102,7 @@ class Actor(nn.Module):
             # Note: dschf is defined in function scope to avoid global effects
             # https://huggingface.co/docs/transformers/deepspeed#non-trainer-deepspeed-integration
             if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
+                _patch_zero3_weight_mapping()
                 dschf = HfDeepSpeedConfig(ds_config)
             else:
                 dschf = None

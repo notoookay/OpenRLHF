@@ -152,3 +152,4 @@ core
 exp
 wandb
 .claude/*
+*tmp*

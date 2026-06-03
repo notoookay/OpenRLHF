@@ -12,7 +12,7 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from openrlhf.models import Actor, PolicyLoss
+from openrlhf.models import Actor, PolicyLoss, aggregate_loss
 from openrlhf.models.utils import compute_approx_kl, masked_mean
 from openrlhf.trainer.ppo_utils.experience import Experience
 from openrlhf.utils import get_tokenizer
@@ -23,6 +23,7 @@ from openrlhf.utils.deepspeed.deepspeed_utils import (
 )
 from openrlhf.utils.distributed_util import stateless_init_process_group, torch_dist_barrier_and_cuda_sync
 from openrlhf.utils.logging_utils import init_logger
+from openrlhf.utils.loss_utils import get_loss_batch_info
 from openrlhf.utils.vlm_utils import merge_mm_train_inputs
 
 from ..ppo_utils import NaiveReplayBuffer
@@ -258,6 +259,13 @@ class ActorPPOTrainer(ABC):
         old_action_log_probs = experience.action_log_probs
         advantages = experience.advantages
         base_action_log_probs = experience.base_action_log_probs
+        loss_batch_info = get_loss_batch_info(
+            self.strategy,
+            action_mask,
+            replay_buffer=self.replay_buffer,
+            step=step,
+            dynamic_batch=self.args.train.dynamic_batch_enable,
+        )
 
         # VLM: merge pre-processed multimodal inputs for training forward
         mm_inputs = {}
@@ -287,6 +295,7 @@ class ActorPPOTrainer(ABC):
             advantages,
             action_mask=experience.action_mask,
             rollout_log_probs=experience.rollout_log_probs,
+            **loss_batch_info,
         )
         experience.info["ppo_clip_ratio"] = clip_ratio.detach()
         experience.info["ppo_kl"] = ppo_kl.detach()
@@ -304,7 +313,7 @@ class ActorPPOTrainer(ABC):
             else:
                 kl = torch.zeros_like(action_log_probs)
                 logprobs_diff = torch.zeros_like(action_log_probs)
-            kl_loss = masked_mean(kl, experience.action_mask)
+            kl_loss = aggregate_loss(kl, experience.action_mask, **loss_batch_info)
             logprobs_diff = masked_mean(logprobs_diff, experience.action_mask)
             experience.info["kl"] = kl_loss.detach()
             experience.info["logprobs_diff"] = logprobs_diff.detach()
@@ -314,15 +323,19 @@ class ActorPPOTrainer(ABC):
         loss = actor_loss + kl_loss * kl_ctl
         # mixtral
         if self.aux_loss:
-            loss += output.aux_loss * self.args.actor.aux_loss_coef
+            aux_loss = output.aux_loss * self.args.actor.aux_loss_coef
+            if self.args.train.dynamic_batch_enable:
+                aux_loss = aux_loss * self.replay_buffer.dynamic_sample_loss_scale[step]
+            loss += aux_loss
         # entropy loss
         if self.args.actor.entropy_coef is not None:
-            entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
+            entropy_loss = aggregate_loss(
+                output.entropy[:, -experience.action_mask.shape[1] :],
+                experience.action_mask,
+                **loss_batch_info,
+            )
             if self.args.actor.entropy_coef != 0:
                 loss -= entropy_loss * self.args.actor.entropy_coef
-
-        if self.args.train.dynamic_batch_enable:
-            loss = loss * self.replay_buffer.dynamic_loss_scale[step]
 
         self.strategy.backward(loss, self.actor, self.actor_optim)
         if self.args.train.dynamic_batch_enable:

@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from openrlhf.models import SFTLoss
 from openrlhf.utils.distributed_sampler import DistributedSampler
+from openrlhf.utils.loss_utils import get_loss_batch_info
 
 
 class SFTTrainer(ABC):
@@ -161,7 +162,12 @@ class SFTTrainer(ABC):
                     aux_loss = output.aux_loss
                 else:
                     aux_loss = 0
-                gpt_loss = self.loss_fn(per_token_log_probs, loss_mask[:, :-1])
+                shifted_loss_mask = loss_mask[:, :-1]
+                gpt_loss = self.loss_fn(
+                    per_token_log_probs,
+                    shifted_loss_mask,
+                    **get_loss_batch_info(self.strategy, shifted_loss_mask),
+                )
                 loss = gpt_loss + aux_loss * self.args.model.aux_loss_coef
                 self.strategy.backward(loss, self.model, self.optimizer)
                 self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
